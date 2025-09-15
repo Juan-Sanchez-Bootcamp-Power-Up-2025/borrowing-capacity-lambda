@@ -1,6 +1,9 @@
 import json
 import logging
+import os
 from decimal import Decimal, ROUND_HALF_UP, getcontext
+
+import boto3
 
 # Configure logger
 logger = logging.getLogger()
@@ -72,6 +75,88 @@ def compute_decision(payload: dict) -> str:
         return "REJECTED"
 
 
+def build_amortization_schedule_using_fixed_fee(amount: Decimal,
+                                                term_months: int,
+                                                annual_rate: Decimal,
+                                                fixed_monthly_fee: Decimal):
+    """
+    Build amortization schedule when the monthly fee is already known (monthlyDebt).
+    We split each month into interest and principal using the monthly rate.
+
+    interest_m = balance * i_month
+    principal_m = min(fee - interest_m, balance)
+    balance = balance - principal_m
+    """
+    i_month = annual_rate / D(12) if annual_rate else D("0")
+    balance = amount
+    schedule = []
+
+    for m in range(1, term_months + 1):
+        interest = round2(balance * i_month)
+        principal = fixed_monthly_fee - interest
+        if principal < D("0"):
+            principal = D("0")
+        # last month fix to avoid negative balance due to rounding
+        if principal > balance:
+            principal = balance
+        principal = round2(principal)
+        balance = round2(balance - principal)
+
+        schedule.append({
+            "month": m,
+            "interest": float(interest),
+            "principal": float(principal),
+            "remaining": float(balance),
+        })
+
+        if balance <= D("0.00"):
+            break
+
+    return schedule
+
+
+# ========== Email (SES) ==========
+
+def send_schedule_email_if_configured(to_email: str,
+                                      decision: str,
+                                      amount: Decimal,
+                                      term: int,
+                                      monthly_fee: Decimal,
+                                      schedule: list):
+    """
+    Send the amortization schedule by email via AWS SES
+    """
+    ses = boto3.client("ses", region_name="us-east-2")
+
+    subject = f"[CrediYa] Your loan decision: {decision}"
+    header = [
+        f"Decision: {decision.lower()}",
+        f"Amount: {round2(amount)}",
+        f"Term (months): {term}",
+        f"Monthly fee: {round2(monthly_fee)}",
+        "",
+        "Installment plan (month; interest; principal; remaining):"
+    ]
+    rows = [f"{r['month']}; {r['interest']}; {r['principal']}; {r['remaining']}" for r in schedule]
+    body_txt = "\n".join(header + rows)
+
+    try:
+        ses.send_email(
+            Source="email",
+            Destination={"ToAddresses": [to_email]},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {
+                    "Text": {"Data": body_txt, "Charset": "UTF-8"}
+                }
+            }
+        )
+        logger.info("SES email sent to %s", to_email)
+    except Exception as e:
+        # Best-effort: log and continue
+        logger.warning("SES send failed: %s", e)
+
+
 # === HTTP Response Helper ===
 
 def _response(status: int, body: dict):
@@ -114,6 +199,31 @@ def lambda_handler(event, context):
 
         # Compute credit decision
         decision = compute_decision(payload)
+
+        # Build schedule for the email (only for the NEW loan)
+        la = payload["loanApplication"]
+        to_email = la.get("email")
+        amount   = D(la["amount"])
+        term     = int(la["term"])
+        annual   = D(la.get("annualInterestRate", "0"))
+        monthly_fee = D(la["monthlyDebt"])
+
+        schedule = build_amortization_schedule_using_fixed_fee(
+            amount=amount,
+            term_months=term,
+            annual_rate=annual,
+            fixed_monthly_fee=monthly_fee
+        )
+
+        # Best-effort email
+        send_schedule_email_if_configured(
+            to_email=to_email,
+            decision=decision,
+            amount=amount,
+            term=term,
+            monthly_fee=monthly_fee,
+            schedule=schedule
+        )
 
         # Return decision
         return _response(200, {"status": decision})
