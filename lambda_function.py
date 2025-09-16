@@ -57,21 +57,21 @@ def compute_decision(payload: dict) -> str:
     cap_max = round2(base_salary * D("0.35"))
 
     # 2. Current debt = sum of monthlyDebt from approved loans
-    deuda_actual = round2(sum(D(approved["monthlyDebt"]) for approved in approved_list) if approved_list else D("0"))
+    current_debt = round2(sum(D(approved["monthlyDebt"]) for approved in approved_list) if approved_list else D("0"))
 
     # 3. Available capacity = max capacity - current debt
-    cap_disp = round2(cap_max - deuda_actual)
+    cap_disp = round2(cap_max - current_debt)
 
     # 4. Decision logic
     if monthly_new <= cap_disp:
-        print(monthly_new, "<=" ,cap_disp)
+        print(monthly_new, "<=", cap_disp)
         # Extra rule: if amount > 5 times salary → send to manual review
-        if amount > base_salary * D(5):
-            print(amount, ">" ,base_salary * D(5))
+        if amount > cap_max):
+            print(amount, ">", cap_max)
             return "MANUAL_REVIEW"
         return "APPROVED"
     else:
-        print(monthly_new, ">" ,cap_disp)
+        print(monthly_new, ">", cap_disp)
         return "REJECTED"
 
 
